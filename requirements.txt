@@ -1,0 +1,5 @@
+# Runtime dependency: official OpenAI Python SDK
+openai>=1.40,<3
+
+# Development / testing (also available via `pip install -e .[dev]`)
+pytest>=8.0
