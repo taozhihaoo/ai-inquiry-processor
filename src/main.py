@@ -176,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
 def _build_rows(inquiries, outcome):
     """Pair each input inquiry (with its CSV line number) with its stored record."""
     rows = []
-    for inquiry, submit in zip(inquiries, outcome.outcomes):
+    for inquiry, submit in zip(inquiries, outcome.outcomes, strict=True):
         record = submit.record
         rows.append(
             {

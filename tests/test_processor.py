@@ -1,7 +1,7 @@
 """Tests for batch processing: per-item isolation and failure handling."""
 
 from src.llm_client import LLMRetryableError
-from src.models import Inquiry, STATUS_ERROR, STATUS_SUCCESS
+from src.models import STATUS_ERROR, STATUS_SUCCESS, Inquiry
 from src.processor import InquiryProcessor
 
 VALID_PAYLOAD = {"summary": "ok", "category": "General Question", "priority": "Low"}

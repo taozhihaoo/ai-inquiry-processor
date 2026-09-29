@@ -1,156 +1,94 @@
-# AI Inquiry Processor
+# AI Inquiry Processor — AI Customer Support Desk
 
-**A lightweight Python service that turns raw customer inquiries into structured triage data — summary, category, priority — via LLM structured outputs, with a CLI, a REST API, SQLite persistence, and idempotent duplicate handling.**
+**A lightweight Python service that triages customer inquiries with LLM structured outputs, and a working support desk core on top: customers, tickets, inbox, tags, assignment, notes, history, search, AI analysis with suggested replies, RBAC and an audit log — CLI, REST API, SQLite, 280 offline tests.**
 
-`Python 3.11+` · `OpenAI SDK (structured outputs)` · `FastAPI` · `SQLite` · `pytest (offline)` · `Docker`
+`Python 3.11+` · `FastAPI` · `OpenAI SDK (structured outputs)` · `SQLite` · `pytest (offline)` · `Docker`
 
-> Independent portfolio project. The OpenAI integration is fully implemented and tested against a fake SDK; the default test suite runs completely offline. Demo mode requires no API credentials. Real OpenAI calls require you to provide your own key.
+> Independent portfolio project. OpenAI integration is fully implemented and tested against a fake SDK — default tests never call the network. Demo mode needs no credentials. Real OpenAI calls require your own key. The built-in authentication is a development/demo mechanism, not production identity management.
+
+**AI-generated fields are suggestions / classifications and may require human review.** The system stores them as advisory data (`ai_*` fields); it never presents them as decided facts and never auto-sends generated replies.
 
 ---
 
+## Project Overview
+
+Phase 1 was a CSV → LLM → CSV triage tool. Phase 2 added a service layer, REST API, SQLite persistence and idempotency. Phase 3 evolves it into an **AI Customer Support Desk** core:
+
+```
+Customer ──▶ Ticket ──▶ AI Processing (summary / category / urgency / sentiment)
+               │              ▲
+               │              └── always via LLMClient → OpenAI | Mock
+               ├── Tags · Assignment · Status workflow
+               ├── Internal Notes · Conversation messages
+               └── History events · Audit log
+```
+
 ## Features
 
-- **Structured outputs, enforced twice** — requests pin a strict `json_schema` response format; every response is independently re-validated (missing fields, wrong types, off-enum values become per-row errors, never corrupt data).
-- **Provider abstraction** — a tiny `LLMClient` protocol with two implementations: `OpenAIClient` (official SDK) and `MockLLMClient` (deterministic, offline). Adding a vendor = one class.
-- **Idempotent processing** — every inquiry gets a stable SHA-256 content identity. Resubmitting the same inquiry (via CLI or API) returns the stored result without calling the LLM again.
-- **Durable storage** — SQLite (stdlib `sqlite3`, parameterized queries, no ORM) with per-inquiry records, token usage, and batch runs.
-- **Reliability** — per-call timeout, retry with exponential backoff, `Retry-After` honored, retryable-vs-permanent error taxonomy, single-item failure isolation.
-- **REST API + CLI on one service layer** — both entry points call the same `InquiryService`; no duplicated business logic.
-- **Usage tracking** — token counts and latency persisted when the provider reports them; `null` when it doesn't (nothing is fabricated). Optional cost estimation from a configured price table.
-- **139 offline tests** — unit + integration + API tests with a fake SDK; deterministic, no network, no credentials.
+- **Inbox** — list/filter tickets by status (`open/pending/resolved/closed`), priority (`low/normal/high/urgent`), assignee (incl. unassigned), customer and tag; full-text search across subject, customer name/email and message bodies.
+- **Tickets with a real workflow** — explicit, enforced status transitions (invalid transitions get `409`), reopen supported, resolution timestamps managed automatically.
+- **Customers** — create/find/search; duplicate emails resolve to the same customer; per-customer ticket lists.
+- **Tags** — admin-managed vocabulary, linked to tickets (idempotent link/unlink).
+- **Agents & assignment** — `agent` and `admin` roles; assign/unassign with permission rules; per-agent queues.
+- **Internal notes** — agent-only remarks with authorship, distinct from the customer conversation.
+- **Ticket history** — every status/priority/assignment/tag/note/AI change recorded as an event with actor + JSON metadata.
+- **AI analysis** — summary, key points, category, suggested priority, urgency, sentiment per ticket (advisory only). Provider-agnostic via the `LLMClient` abstraction with strict `json_schema` outputs and response re-validation.
+- **AI suggested reply** — a draft generated from the latest customer message; stored on the ticket, clearly labelled as a draft, never auto-sent.
+- **Duplicate detection** — content-hash (SHA-256 over customer + normalized message); re-submitting the same open ticket's content returns `409` with the existing ticket id. Closed tickets can be re-submitted fresh. (The Phase 2 inquiry pipeline keeps its own idempotency: identical inquiries return the stored result, flagged `duplicate`.)
+- **RBAC + audit log** — minimal role checks in the service layer; every important action lands in a queryable audit log (admin-only read).
+- **Resilience (Phase 2 heritage)** — timeout, retry with exponential backoff, `Retry-After` honored, retryable-vs-permanent error taxonomy, per-item failure isolation, usage/latency tracking (null when the provider reports nothing — never fabricated).
 
 ## Architecture
 
 ```
-                ┌────────────┐      ┌──────────────┐
-                │    CLI     │      │  FastAPI      │
-                │ (src.main) │      │  (src.api)    │
-                └─────┬──────┘      └──────┬────────┘
-                      │  same entry point  │
-                      ▼                    ▼
-                ┌─────────────────────────────────┐
-                │      InquiryService (src.service)│   idempotency · runs ·
-                │      single business entry       │   usage/cost · persistence
-                └───────────────┬─────────────────┘
-                                ▼
-                ┌─────────────────────────────────┐
-                │   InquiryProcessor (src.processor)│  per-item error isolation
-                └───────────────┬─────────────────┘
-                                ▼
-                     LLMClient protocol (src.llm_client)
-                     ├── OpenAIClient  (official SDK, strict json_schema,
-                     │                  timeout, retry + backoff, Retry-After)
-                     └── MockLLMClient (deterministic offline rules)
-                                ▼
-                ┌─────────────────────────────────┐
-                │   InquiryStore (src.storage)     │  SQLite: inquiries + runs
-                └─────────────────────────────────┘
+            ┌─────────────┐   ┌──────────────────────────────────┐
+            │  CLI        │   │  FastAPI (src/api.py)            │
+            │ (src.main)  │   │  inquiry endpoints + desk router │
+            └──────┬──────┘   └───────┬──────────────────┬───────┘
+                   │                  │                  │
+                   ▼                  ▼                  ▼
+        ┌────────────────────┐  ┌──────────────────────────────────┐
+        │ InquiryService     │  │ DeskService (src/desk/service.py)│
+        │ (src/service.py)   │  │ workflow · RBAC · dedup · audit  │
+        └─────────┬──────────┘  └───────┬──────────────┬───────────┘
+                  ▼                     ▼              ▼
+        ┌────────────────────┐  ┌─────────────┐  ┌───────────────┐
+        │ InquiryProcessor   │  │ desk.ai     │  │ DeskStore     │
+        └─────────┬──────────┘  └──────┬──────┘  └──────┬────────┘
+                  ▼                    ▼                ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │ LLMClient protocol → OpenAIClient (strict json_schema,   │
+        │ retry/backoff) | MockLLMClient (deterministic, offline)  │
+        └──────────────────────────────────────────────────────────┘
+                  ▼
+        SQLite (one file): inquiries + processing_runs (Phase 2)
+                         + customers/agents/tags/tickets/messages/
+                           notes/ticket_tags/ticket_events/audit_log (Phase 3)
 ```
 
-Data flow: input (CSV row / HTTP request) → content-hash identity → pending row in SQLite → provider call with retries → strict schema validation → success/error update → report or HTTP response.
-
-## CLI
-
-```bash
-python -m src.main --demo                     # offline demo (mock provider, no key)
-python -m src.main --input inquiries.csv      # real run (reads OPENAI_API_KEY)
-python -m src.main --demo --db data/demo.db --format csv -o reports
-python -m src.main --help / --version
-```
-
-The CLI loads the CSV, hands everything to `InquiryService`, then renders JSON/CSV reports from the persisted records and prints the run summary:
-
-```
-run: e9c72e5cf0a94ecbb6f1ccf0f32db2a5
-processed 8 inquiries: 8 succeeded, 0 failed, 0 duplicates
-```
-
-Input CSV: header must contain `customer_name` and `message` (see [`sample_inquiries.csv`](sample_inquiries.csv) — 8 fictional inquiries covering all categories and priorities). Exit codes: `0` ok · `1` input error · `2` config error.
-
-## REST API
-
-Start: `uvicorn src.api:app --host 127.0.0.1 --port 8000` (interactive docs at `/docs`).
-
-| Method | Path | Purpose | Success | Errors |
-| --- | --- | --- | --- | --- |
-| GET | `/health` | liveness + database + provider | `200` | — |
-| POST | `/inquiries` | process one inquiry (idempotent) | `201` | `422` validation |
-| POST | `/inquiries/batch` | process up to 1000 inquiries as one run | `200` | `422` validation |
-| GET | `/inquiries/{id}` | fetch a stored result | `200` | `404` unknown id |
-
-```bash
-# process one inquiry
-curl -X POST http://127.0.0.1:8000/inquiries \
-  -H "Content-Type: application/json" \
-  -d '{"customer_name": "Alice", "message": "I cannot log into my account."}'
-
-# → 201
-{
-  "id": "39d8b8625a967e10279b37d9a8bf55b8dde67b93a68423652b4dcca829bd3b42",
-  "status": "success",
-  "summary": "Alice: I cannot log into my account after resetting my password.",
-  "category": "Technical Support",
-  "priority": "Medium",
-  "error_message": null,
-  "duplicate": false,
-  "created_at": "2026-09-29T15:31:16.641+00:00",
-  "updated_at": "2026-09-29T15:31:16.650+00:00"
-}
-```
-
-Behaviour notes (all covered by tests):
-
-- **Duplicates**: resubmitting identical content returns the stored result with `"duplicate": true` — the LLM is not called again. Failed rows are also remembered: a known-bad inquiry is not re-processed.
-- **Batch partial failure**: one bad row never fails the batch. `POST /inquiries/batch` answers `200` with per-row `status` and run-level counts:
-
-```json
-{
-  "run_id": "28777141f7584cfaa1d42f83ca4b1fab",
-  "total": 3, "succeeded": 2, "failed": 1, "duplicates": 0,
-  "results": [ ... ]
-}
-```
-
-- **Safe errors**: provider/storage failures become JSON like `{"error": {"code": "storage_error", "message": "database operation failed"}}` — no tracebacks, no internals, no keys.
-
-There is deliberately **no authentication** on this API; see [Limitations](#limitations).
+Layering rules: the API never writes SQL and never calls a provider; the service never imports FastAPI; all AI goes through `LLMClient`.
 
 ## Data Model
 
-SQLite schema (created automatically, idempotent):
+Phase 2 tables (unchanged): `inquiries` (content-hash id, status, analysis, usage), `processing_runs`.
 
-- **`inquiries`** — `id` (PK, SHA-256 of normalized `customer_name` + `message`), `customer_name`, `message`, `status` (`pending`/`success`/`error`), `summary`, `category`, `priority`, `error_message`, `run_id`, `provider`, `model`, `input_tokens`, `output_tokens`, `total_tokens`, `latency_ms`, `attempts`, `estimated_cost`, `created_at`, `updated_at`.
-- **`processing_runs`** — `run_id`, `provider`, `model`, `started_at`, `finished_at`, `total`, `succeeded`, `failed`.
+Phase 3 tables (added by idempotent migration; old databases keep working):
 
-`category` is always one of `Sales | Technical Support | Billing | General Question`; `priority` is `Low | Medium | High` — enforced in the request-side JSON schema *and* by response-side validation.
+| Table | Key fields |
+| --- | --- |
+| `customers` | `id`, `name`, `email` (unique), `external_id?`, timestamps |
+| `agents` | `id`, `name`, `email` (unique), `role` (`agent`/`admin`), `active`, timestamps |
+| `tags` | `id`, `name` (unique, case-insensitive) |
+| `tickets` | `id`, `customer_id`→customers, `subject`, `status`, `priority`, `assignee_id`→agents?, `content_hash`, `resolved_at?`, `ai_summary`, `ai_key_points` (JSON), `ai_category`, `ai_suggested_priority`, `ai_urgency`, `ai_sentiment`, `ai_reply`, `ai_analyzed_at`, `ai_provider/model/tokens`, timestamps |
+| `ticket_messages` | `id`, `ticket_id`→tickets, `author_type` (`customer`/`agent`/`system`), `author_name`, `body`, `content_hash` |
+| `internal_notes` | `id`, `ticket_id`, `author_id`, `author_name`, `body` |
+| `ticket_tags` | (`ticket_id`, `tag_id`) composite PK |
+| `ticket_events` | `id`, `ticket_id`, `event_type`, `actor_id?`, metadata JSON |
+| `audit_log` | `id`, `actor_id?`, `action`, `entity_type`, `entity_id`, metadata JSON |
 
-## LLM Providers
+Vocabularies: status `open/pending/resolved/closed` · priority & urgency `low/normal/high/urgent` · sentiment `positive/neutral/negative` · AI category reuses the Phase 2 set `Sales / Technical Support / Billing / General Question`.
 
-Selected via `LLM_PROVIDER` (or `--provider` / `--demo`):
-
-| Provider | Value | Needs key | Behaviour |
-| --- | --- | --- | --- |
-| OpenAI | `openai` | yes (`OPENAI_API_KEY`) | `gpt-4o-mini` by default; strict `json_schema` structured outputs; SDK internal retries disabled (this project owns the retry policy) |
-| Mock | `mock` | no | deterministic keyword-based classification; identical input → identical verdict; used by `--demo`, tests, and the default Docker image |
-
-`MockLLMClient` reports `usage: null` because no real tokens are consumed — nothing is invented.
-
-## Configuration
-
-All configuration is environment-based (see [`.env.example`](.env.example)); `.env` files are supported but real environment variables always win.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `LLM_PROVIDER` | `openai` (CLI) / `mock` (bare `uvicorn` & Docker) | provider selection |
-| `OPENAI_API_KEY` | — | API key; never hardcoded, never logged |
-| `OPENAI_MODEL` | `gpt-4o-mini` | model name |
-| `OPENAI_BASE_URL` | SDK default | point at any OpenAI-compatible endpoint |
-| `LLM_TIMEOUT_SECONDS` | `30` | per-call timeout |
-| `LLM_MAX_RETRIES` | `3` | retries after the first attempt |
-| `LLM_RETRY_INITIAL_DELAY` / `LLM_RETRY_MAX_DELAY` | `1.0` / `10.0` | exponential backoff bounds |
-| `AI_INQUIRY_DB_PATH` | `data/inquiries.db` | SQLite location (`:memory:` for tests) |
-| `AI_INQUIRY_OUTPUT_DIR` | `output` | report directory |
-| `LLM_PRICE_INPUT_PER_MTOK` / `LLM_PRICE_OUTPUT_PER_MTOK` | unset | USD per 1M tokens; **both** required for `estimated_cost` |
+Indexes on ticket status, priority, assignee, customer, updated_at, content_hash. All SQL is parameterized; foreign keys enforced.
 
 ## Running Locally
 
@@ -158,110 +96,187 @@ All configuration is environment-based (see [`.env.example`](.env.example)); `.e
 git clone https://github.com/taozhihaoo/ai-inquiry-processor.git
 cd ai-inquiry-processor
 python -m venv .venv
-source .venv/Scripts/activate        # Windows Git Bash; .venv/bin/activate elsewhere
+.\.venv\Scripts\Activate.ps1        # PowerShell; source .venv/bin/activate on bash
 pip install -r requirements.txt
 
-python -m src.main --demo            # CLI demo
-uvicorn src.api:app --port 8000      # API (defaults to mock provider)
+python -m src.main --demo                          # CLI triage demo (offline)
+uvicorn src.api:app --host 127.0.0.1 --port 8000   # API with desk (mock provider)
+# Swagger UI: http://127.0.0.1:8000/docs
 ```
+
+## Demo / Seed Data
+
+Fictional demo dataset (3 agents, 4 customers, 6 tags, 8 tickets across all statuses/priorities, 3 AI-analyzed, 1 AI reply draft — one seeded ticket deliberately demonstrates duplicate detection):
+
+```bash
+python -m src.desk.seed                             # seed data/inquiries.db (skips if populated)
+python -m src.desk.seed --db path/to/db.sqlite      # explicit target
+python -m src.desk.seed --reset                     # wipe desk tables, reseed (inquiries kept)
+```
+
+To explore the API as a seeded admin, pass `X-Agent-Id: <admin id>` — get ids with:
+
+```bash
+python -c "from src.desk.storage import DeskStore; [print(a.id, a.role, a.name) for a in DeskStore('data/inquiries.db').list_agents()]"
+```
+
+## REST API
+
+Interactive docs at `/docs` (Swagger, Try-it-out). Existing Phase 2 endpoints are unchanged: `GET /health`, `POST /inquiries`, `POST /inquiries/batch`, `GET /inquiries/{id}`.
+
+Desk endpoints (all require the `X-Agent-Id` dev-auth header):
+
+```
+POST   /customers                      create (200 existing / 201 new)
+GET    /customers?search=              list/search
+GET    /customers/{id}                 fetch
+GET    /customers/{id}/tickets         customer's tickets
+
+GET    /tickets                        inbox: ?status= ?priority= ?assignee=|none
+                                       ?customer_id= ?tag= ?search= ?limit= ?offset=
+POST   /tickets                        create (409 on duplicate content)
+GET    /tickets/{id}                   detail (ticket + customer + assignee + tags + messages)
+PATCH  /tickets/{id}                   status/priority/subject (409 on invalid transition)
+POST   /tickets/{id}/assign            { "agent_id": "..." }
+POST   /tickets/{id}/unassign
+POST   /tickets/{id}/messages          record an inbound customer message
+POST   /tickets/{id}/notes             internal note      GET …/notes
+POST   /tickets/{id}/tags              { "tag_id": "..." }   DELETE …/tags/{tag_id}
+GET    /tickets/{id}/history           ticket events
+
+POST   /tickets/{id}/ai/analyze        summary/key points/category/urgency/sentiment
+POST   /tickets/{id}/ai/suggest-reply  draft reply (never auto-sent)
+
+GET    /tags                           POST /tags                (admin)
+GET    /agents                         POST /agents              (admin)
+GET    /agents/{id}/tickets
+GET    /audit                          admin-only, newest first
+```
+
+Status codes in use: `200/201/204` success · `400` validation · `401` missing/unknown/inactive agent · `403` insufficient role · `404` unknown entity · `409` duplicate ticket / invalid transition · `422` malformed body · `502` provider failure. Errors are always `{"error": {"code", "message", ...}}` — no tracebacks, no internals.
+
+## AI Capabilities
+
+| Operation | Endpoint/service path | Output (advisory) |
+| --- | --- | --- |
+| Ticket analysis | `POST /tickets/{id}/ai/analyze` → `DeskService.ai_analyze_ticket` → `desk.ai` → `LLMClient.complete_structured` | summary, 1–5 key points, category, suggested priority, urgency, sentiment |
+| Suggested reply | `POST /tickets/{id}/ai/suggest-reply` | draft text generated from the latest customer message; stored as `ai_reply`, labelled as a draft |
+| Inquiry triage | Phase 2 pipeline unchanged | summary, category, priority |
+
+All calls pin a strict `json_schema` response format **and** are re-validated against the vocabularies before persistence. The mock provider implements the same schemas deterministically (keyword heuristics), so demos, tests and CI run fully offline; usage fields stay `null` for the mock — no fabricated tokens.
+
+## Roles / Permissions
+
+| Capability | agent | admin |
+| --- | --- | --- |
+| View tickets/customers/tags/agents, search | ✅ | ✅ |
+| Modify ticket (status/priority/subject/assign/tags) | unassigned or own tickets | any ticket |
+| Add internal notes / customer messages, use AI | ✅ | ✅ |
+| Create customers | ✅ | ✅ |
+| Create agents, create tags, read audit log | ❌ | ✅ |
+
+**Development authentication (demo only):** send `X-Agent-Id: <agent id>`. Unknown, missing or deactivated ids get `401`; insufficient role gets `403`. This exists so the RBAC layer is real and testable without building an identity provider. **It is not production authentication** — no OAuth, no JWT, no SSO, no secrets. Put the service behind your own gateway for anything real.
+
+## Audit Log
+
+`GET /audit` (admin) returns entries for ticket created/status/priority changes, assignment changes, tag changes, notes, messages, AI actions, customer and agent creation. Entries carry actor id, action, entity, and whitelisted metadata only — no prompts, no credentials, no authorization headers.
+
+## Search
+
+`GET /tickets?search=<term>` matches ticket subject, customer name, customer email and message bodies via parameterized SQLite `LIKE` with user wildcards escaped. No Elasticsearch, no external services.
+
+## Testing
+
+```bash
+pytest        # 280 tests, fully offline: fake SDK, mock LLM, temp SQLite
+ruff check .  # lint (CI enforces)
+```
+
+Coverage highlights: workflow transitions (valid/invalid/no-op), RBAC (401/403 paths), duplicate detection, assignment permissions, notes/tags/history/audit, AI analyze + suggest reply (advisory-only asserted), migration from a Phase 2 database (old data preserved, new tables added, app boots), seed idempotency, full HTTP contract (`200/201/204/400/401/403/404/409/422`), plus all 139 Phase 2 tests kept green. CI also runs the lint, the migration tests, and executes the seed CLI twice on a fresh database.
+
+## OpenAI API Usage
+
+Implemented but **not executed against the live API** in the environment where this README was last verified (no `OPENAI_API_KEY` present — stated deliberately). To run for real:
+
+```bash
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=your-key        # https://platform.openai.com/api-keys
+```
+
+Set it for the CLI or `docker compose up` (see below). Token usage is stored when the provider reports it and stays `null` otherwise; `estimated_cost` (inquiry pipeline) requires explicitly configured prices and is an **estimate**, never a billing figure.
+
+## Configuration
+
+See [`.env.example`](.env.example). Key variables: `LLM_PROVIDER` (`openai`/`mock`), `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_RETRY_INITIAL_DELAY`, `LLM_RETRY_MAX_DELAY`, `AI_INQUIRY_DB_PATH`, `AI_INQUIRY_OUTPUT_DIR`, optional `LLM_PRICE_*_PER_MTOK`. Defaults: mock provider for bare `uvicorn` and Docker; `openai` for a bare CLI run.
 
 ## Running with Docker
 
 ```bash
-docker compose up          # mock provider, http://127.0.0.1:8000
+docker compose up          # mock provider; Swagger at http://127.0.0.1:8000/docs
 curl http://127.0.0.1:8000/health
+python -m src.desk.seed --db <volume path>/data/inquiries.db   # optional demo data
 ```
 
-- Runs as a non-root user; SQLite and reports live on named volumes (`/app/data`, `/app/output`).
-- `.env` is never copied into the image (`.dockerignore`); pass secrets at runtime only:
+Non-root container, named volumes for `/app/data` and `/app/output`, healthcheck on `/health`. `.env` is never baked into the image; inject secrets at runtime:
 
 ```bash
 LLM_PROVIDER=openai OPENAI_API_KEY=sk-... docker compose up
 ```
 
-- A `HEALTHCHECK` hits `/health` every 30s.
+*Docker config is provided but has not been executed in this environment (no Docker daemon available at verification time).*
 
-## Testing
+## Security Notes
 
-```bash
-pytest            # 139 tests, fully offline: fake SDK + mock provider + tmp SQLite
-```
-
-Layers covered: schema validation · CSV validation · retry/backoff (incl. `Retry-After`) · permanent-error fail-fast · idempotency & duplicates · SQLite round-trips & failure handling · service-level batch isolation · full HTTP contract (success, validation 422, duplicate, 404, storage-failure 500, provider-error rows) · CLI→SQLite→JSON-report integration. No test ever calls the real API.
-
-CI (`.github/workflows/ci.yml`) runs an import check plus the full suite on Python 3.11/3.12/3.13 with `OPENAI_API_KEY` explicitly blanked.
-
-## Demo Mode
-
-`--demo` (or the default Docker image / bare `uvicorn`) uses `MockLLMClient`: the complete input → processing → persistence → report flow runs without any credentials and is fully deterministic. Demo and real mode share every code path except the provider class.
-
-## OpenAI API Usage
-
-The integration is **implemented but was not executed in the environment where this README was last verified** (no `OPENAI_API_KEY` present — stated here deliberately, not faked). To run for real:
-
-```bash
-export LLM_PROVIDER=openai
-export OPENAI_API_KEY=your-key       # from https://platform.openai.com/api-keys
-python -m src.main --input your_inquiries.csv
-```
-
-Usage metadata (`input_tokens` / `output_tokens` / `total_tokens`, latency, attempts) is stored per inquiry when the provider reports it. If you set both price variables, `estimated_cost` is computed from them — it is an **estimate**, not a billing figure, and stays `null` when usage or prices are unavailable.
-
-## Error Handling
-
-| Failure | Handling |
-| --- | --- |
-| Rate limit (429) / network / 5xx / timeout | retried with exponential backoff; provider `Retry-After` honored |
-| Bad credentials, malformed/truncated/refused responses | `LLMPermanentError` — fail fast, no retry |
-| One inquiry fails | row marked `error` with reason; batch and API continue |
-| Resubmission of a failed inquiry | stored error returned, LLM not re-called (documented semantics) |
-| Database failure | wrapped as `StorageError`; API returns an opaque `500 storage_error` |
-| Invalid API input | FastAPI/Pydantic `422` with field-level details |
-
-## Security
-
-- API keys are read **only** from environment variables — never hardcoded, logged, or written to reports; `.env` is git-ignored and docker-ignored; `.env.example` ships placeholders only.
-- Customer text travels as JSON data in the user message with a fixed system prompt; a test asserts injection attempts cannot alter the instructions.
-- `output/` and `data/` (reports, databases) are git-ignored.
-- Parameterized SQL only; sample data is fictional.
-- No authentication on the API — bind it to localhost or put it behind your own gateway.
+- API keys only from environment variables; never hardcoded, logged, or returned.
+- All SQL parameterized; foreign keys on; user search input wildcard-escaped.
+- Customer text travels as JSON data with a fixed system prompt; a test asserts prompt-injection attempts cannot alter instructions.
+- AI payloads re-validated against fixed vocabularies before persistence.
+- Error responses are structured and opaque (`{"error": {...}}`) — no tracebacks, no provider internals.
+- Audit log stores whitelisted metadata only.
+- `data/`, `output/`, `.env` are git-ignored; sample data is fictional.
+- Development authentication is explicitly not production auth (see above).
 
 ## Project Structure
 
 ```
-ai-inquiry-processor/
-├── README.md · LICENSE · requirements.txt · pyproject.toml
-├── .env.example · .gitignore · .dockerignore
-├── Dockerfile · docker-compose.yml
-├── .github/workflows/ci.yml
-├── sample_inquiries.csv        # fictional sample data
-├── src/
-│   ├── config.py               # env → AppConfig (single source of configuration)
-│   ├── models.py               # dataclasses, JSON schema, SHA-256 identity
-│   ├── llm_client.py           # protocol, OpenAI + mock providers, retry policy
-│   ├── csv_loader.py           # CSV validation
-│   ├── processor.py            # per-item error isolation
-│   ├── storage.py              # SQLite data access (inquiries + runs)
-│   ├── service.py              # InquiryService: idempotency, runs, usage/cost
-│   ├── report_writer.py        # JSON/CSV reports
-│   ├── api.py                  # FastAPI layer (thin, delegates to service)
-│   └── main.py                 # CLI (delegates to service)
-├── tests/                      # 139 offline tests
-├── data/                       # SQLite (created at runtime, git-ignored)
-└── output/                     # reports (created at runtime, git-ignored)
+src/
+├── config.py · models.py · csv_loader.py · report_writer.py     # shared core
+├── llm_client.py        # LLMClient protocol, OpenAI + Mock, retry policy,
+│                        # complete_structured() building block for all AI
+├── processor.py · service.py · storage.py · main.py             # inquiry pipeline
+├── api.py               # FastAPI app: inquiry endpoints + mounted desk router
+└── desk/
+    ├── models.py        # dataclasses + vocabularies + validation
+    ├── workflow.py      # allowed status transitions
+    ├── storage.py       # DeskStore: customers/tickets/tags/agents/notes/events/audit
+    ├── ai.py            # ticket analysis + suggested reply prompts/schemas/validation
+    ├── auth.py          # dev authentication + AgentContext + role checks
+    ├── service.py       # DeskService: RBAC, workflow, dedup, history, audit
+    ├── api.py           # desk REST router (thin transport)
+    └── seed.py          # fictional demo dataset (python -m src.desk.seed)
+tests/                   # 280 offline tests (12 Phase 2 files + 6 desk files)
+Dockerfile · docker-compose.yml · .github/workflows/ci.yml
 ```
 
-## Limitations
+## Current Limitations
 
-Stated plainly, so nobody has to guess:
+Stated plainly:
 
-- **Single-process SQLite** — fine for a portfolio service / small teams; concurrent multi-instance writes would need a real database server.
-- **No authentication / rate limiting on the API** — intentional scope cut for a lightweight service.
-- **No background workers or queues** — batch endpoints process synchronously (bounded at 1000 items).
-- **Synchronous LLM calls** — throughput scales with serial latency; no concurrency yet.
-- **Cost values are estimates** computed from user-configured prices, never from live billing.
-- The OpenAI path is verified against a fake SDK in tests; it has not been executed against the live API in the environment where this README was last updated.
-- Not "production-ready", "enterprise-grade", or "battle-tested" — it is a well-tested, honestly-scoped portfolio project.
+- **Development authentication only** — `X-Agent-Id` header, no real identity provider.
+- **SQLite, single process** — right for this scale; concurrent multi-instance writes need a real database server.
+- **Synchronous AI calls** — no background workers/queues; batch endpoints are bounded (API: 1000 items).
+- **Duplicate detection is hash-based** — same customer + normalized text only; no semantic similarity (intentional).
+- **No frontend** — Swagger is the UI; seed data makes it demoable.
+- **OpenAI path unverified against the live API** in this environment; Docker config not executed here.
+- Not "production-ready" or "battle-tested" — a well-tested, honestly-scoped portfolio project.
+
+## Future Extensions
+
+Planned (not implemented — do not assume otherwise):
+
+- **Email ingestion** — inbound email → ticket (the message layer and content-hash dedup are the natural insertion point).
+- **Webhook integration** — outbound events on ticket changes (ticket_events is the feed).
+- Real authentication (OIDC/JWT), background AI workers, per-customer portals.
 
 ## License
 

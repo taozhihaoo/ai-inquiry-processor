@@ -17,8 +17,9 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import openai
 
@@ -261,16 +262,31 @@ class OpenAIClient:
 
     def analyze_detailed(self, customer_name: str, message: str) -> AnalyzeResult:
         """Run one inquiry and return payload + attempts/latency/usage metadata."""
+        return self.complete_structured(
+            system_prompt=SYSTEM_PROMPT,
+            user_content=build_user_content(customer_name, message),
+            response_format=RESPONSE_FORMAT,
+        )
+
+    def complete_structured(
+        self, *, system_prompt: str, user_content: str, response_format: dict
+    ) -> AnalyzeResult:
+        """Run one structured-output chat completion with the shared retry policy.
+
+        The generic building block for all AI features: caller supplies the
+        prompt pair and strict json_schema; this class supplies model selection,
+        timeout, retries/backoff, payload extraction and usage metadata.
+        """
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_content(customer_name, message)},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ]
 
         def _call() -> tuple[dict[str, Any], TokenUsage | None]:
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
-                response_format=RESPONSE_FORMAT,
+                response_format=response_format,
             )
             return _extract_payload(response)
 
@@ -326,16 +342,95 @@ class MockLLMClient:
 
     def analyze_detailed(self, customer_name: str, message: str) -> AnalyzeResult:
         """Deterministic offline classification; usage is ``None`` (nothing is fabricated)."""
-        text = message.lower()
-        category = self._categorize(text)
+        return self.complete_structured(
+            system_prompt="mock",
+            user_content=build_user_content(customer_name, message),
+            response_format={"json_schema": {"name": "inquiry_analysis"}},
+        )
+
+    def complete_structured(
+        self, *, system_prompt: str, user_content: str, response_format: dict
+    ) -> AnalyzeResult:
+        """Schema-aware deterministic stand-in for the desk AI operations."""
+        schema_name = response_format.get("json_schema", {}).get("name", "")
         started = time.perf_counter()
-        payload = {
-            "summary": self._summarize(customer_name, message),
-            "category": category,
-            "priority": self._prioritize(text, category),
-        }
+        try:
+            data = json.loads(user_content)
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if schema_name == "ticket_analysis":
+            payload = self._ticket_analysis_payload(data)
+        elif schema_name == "suggested_reply":
+            payload = self._suggested_reply_payload(data)
+        else:
+            payload = {
+                "summary": self._summarize(data.get("customer_name", ""), data.get("message", "")),
+                "category": self._categorize(data.get("message", "").lower()),
+                "priority": self._prioritize(
+                    data.get("message", "").lower(),
+                    self._categorize(data.get("message", "").lower()),
+                ),
+            }
         latency_ms = (time.perf_counter() - started) * 1000
         return AnalyzeResult(payload=payload, attempts=1, latency_ms=latency_ms, usage=None)
+
+    _NEGATIVE_KEYWORDS = (
+        "angry", "frustrated", "unacceptable", "worst", "terrible", "fed up",
+        "ridiculous", "disappointed", "useless",
+    )
+    _POSITIVE_KEYWORDS = ("thanks", "thank you", "great", "love", "appreciate", "awesome")
+
+    def _ticket_analysis_payload(self, data: dict) -> dict[str, Any]:
+        subject = str(data.get("subject", ""))
+        message = str(data.get("message", ""))
+        text = message.lower()
+        category = self._categorize(text)
+        is_urgent = any(keyword in text for keyword in self.URGENT_KEYWORDS)
+        if is_urgent:
+            priority, urgency, sentiment_hint = "urgent", "urgent", "negative"
+        elif category in ("Technical Support", "Billing"):
+            priority, urgency, sentiment_hint = "high", "high", "neutral"
+        elif category == "Sales":
+            priority, urgency, sentiment_hint = "low", "low", "neutral"
+        else:
+            priority, urgency, sentiment_hint = "normal", "normal", "neutral"
+        if sentiment_hint == "neutral":
+            if any(keyword in text for keyword in self._NEGATIVE_KEYWORDS):
+                sentiment = "negative"
+            elif any(keyword in text for keyword in self._POSITIVE_KEYWORDS):
+                sentiment = "positive"
+            else:
+                sentiment = "neutral"
+        else:
+            sentiment = sentiment_hint
+        key_points = [
+            sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", message.strip()) if sentence.strip()
+        ][:3] or [message.strip()[:120]]
+        summary = f"{data.get('customer_name', '')}: {subject}".strip()
+        return {
+            "summary": summary[:160],
+            "key_points": key_points,
+            "category": category,
+            "priority": priority,
+            "urgency": urgency,
+            "sentiment": sentiment,
+        }
+
+    def _suggested_reply_payload(self, data: dict) -> dict[str, Any]:
+        name = str(data.get("customer_name", "there")) or "there"
+        subject = str(data.get("subject", "your request"))
+        message = str(data.get("message", "")).strip()
+        first_sentence = re.split(r"(?<=[.!?])\s+", message, maxsplit=1)[0][:160]
+        reply = (
+            f"Hi {name},\n\n"
+            f"Thanks for reaching out about \"{subject}\". "
+            f"We understood your issue as: \"{first_sentence}\". "
+            "We are looking into it and will follow up with the next steps shortly.\n\n"
+            "Best regards,\nSupport Team"
+        )
+        return {"reply": reply}
 
     def _categorize(self, text: str) -> str:
         if any(keyword in text for keyword in self.SUPPORT_KEYWORDS):

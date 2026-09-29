@@ -19,7 +19,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from src.config import load_config
-from src.llm_client import LLMClientError, LLMPermanentError, LLMRetryableError, build_llm_client
+from src.desk.api import build_desk_router, register_desk_exception_handlers
+from src.desk.service import DeskService
+from src.desk.storage import DeskStore
+from src.llm_client import LLMClientError, LLMRetryableError, build_llm_client
 from src.models import Inquiry
 from src.service import InquiryService
 from src.storage import InquiryRecord, InquiryStore, StorageError
@@ -97,18 +100,22 @@ def record_to_out(record: InquiryRecord, *, duplicate: bool = False) -> InquiryO
 def create_app(
     *,
     service: InquiryService | None = None,
+    desk_service: DeskService | None = None,
     provider: str | None = None,
     model: str | None = None,
     db_path: str | None = None,
 ) -> FastAPI:
-    """Build the FastAPI app.
+    """Build the FastAPI app (inquiry pipeline + support desk).
 
-    ``service`` accepts a pre-built :class:`InquiryService` (used by tests);
-    when omitted the service is wired from configuration, exactly like the CLI.
+    ``service`` / ``desk_service`` accept pre-built services (used by tests);
+    when omitted both are wired from configuration over the same database.
     """
     app = FastAPI(
         title="AI Inquiry Processor",
-        description="Summarize, categorize and prioritize customer inquiries with LLM structured outputs.",
+        description=(
+            "Inquiry triage (LLM structured outputs) and an AI customer support desk: "
+            "customers, tickets, tags, assignment, notes, history, search, audit."
+        ),
         version="1.0.0",
     )
     state = app.state
@@ -125,8 +132,9 @@ def create_app(
         config = load_config(provider=resolved_provider, model=model, db_path=db_path)
         store = InquiryStore(config.db_path)
         store.initialize()
+        llm_client = build_llm_client(config)
         state.service = InquiryService(
-            llm_client=build_llm_client(config),
+            llm_client=llm_client,
             store=store,
             provider=config.provider,
             model=config.model,
@@ -134,6 +142,23 @@ def create_app(
             price_output_per_mtok=config.price_output_per_mtok,
         )
         state.storage = store
+        if desk_service is None:
+            desk_store = DeskStore(config.db_path)
+            desk_store.initialize()
+            desk_service = DeskService(
+                store=desk_store, llm_client=llm_client,
+                provider=config.provider, model=config.model,
+            )
+
+    if desk_service is None:
+        desk_store = DeskStore(":memory:")
+        desk_store.initialize()
+        desk_service = DeskService(
+            store=desk_store, llm_client=state.service.llm_client,
+        )
+    state.desk_service = desk_service
+    register_desk_exception_handlers(app)
+    app.include_router(build_desk_router(desk_service))
 
     @app.exception_handler(LLMClientError)
     async def _llm_error_handler(_: Request, exc: LLMClientError) -> JSONResponse:

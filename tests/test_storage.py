@@ -33,7 +33,7 @@ class TestSchemaAndInit:
         assert store.count_inquiries() == 0
 
     def test_creates_database_file_and_tables(self, tmp_path):
-        store = make_store(tmp_path)
+        make_store(tmp_path)
         assert (tmp_path / "t.db").is_file()
         connection = sqlite3.connect(tmp_path / "t.db")
         tables = {
@@ -140,7 +140,6 @@ class TestFailureHandling:
     def test_unopenable_database_raises_storage_error(self, tmp_path):
         directory = tmp_path / "not-a-db"
         directory.mkdir()
-        store = InquiryStore(directory / "inner.db")
         # make the parent a *file* so sqlite cannot create/open the database
         directory.rmdir()
         directory.write_text("this is not sqlite")

@@ -25,9 +25,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Lint (ruff)
+        run: |
+          pip install ruff
+          ruff check .
+
       - name: Basic import check (no API key needed)
         run: |
-          python -c "import src, src.config, src.models, src.llm_client, src.csv_loader, src.processor, src.report_writer, src.storage, src.service, src.main, src.api; print('all modules import cleanly')"
+          python -c "import src, src.config, src.models, src.llm_client, src.csv_loader, src.processor, src.report_writer, src.storage, src.service, src.main, src.api, src.desk, src.desk.models, src.desk.storage, src.desk.service, src.desk.ai, src.desk.auth, src.desk.api, src.desk.seed; print('all modules import cleanly')"
+
+      - name: Migration check (Phase 2 database opens with Phase 3 schema)
+        run: python -m pytest tests/test_migration.py -v
+
+      - name: Seed check (demo data seeds a fresh database, offline)
+        run: |
+          python -m src.desk.seed --db "${{ runner.temp }}/ci-seed.db"
+          python -m src.desk.seed --db "${{ runner.temp }}/ci-seed.db"
 
       - name: Run tests (offline, mock provider)
         env:

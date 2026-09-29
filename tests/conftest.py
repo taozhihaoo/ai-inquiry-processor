@@ -120,3 +120,94 @@ def api_client(service):
     from src.api import create_app
 
     return TestClient(create_app(service=service))
+
+
+# -- desk (Phase 3) fixtures ------------------------------------------------------
+
+@pytest.fixture
+def desk_store(tmp_path):
+    from src.desk.storage import DeskStore
+
+    store = DeskStore(tmp_path / "desk.db")
+    store.initialize()
+    return store
+
+
+@pytest.fixture
+def admin_ctx(desk_store):
+    from src.desk.auth import AgentContext
+
+    agent, _ = desk_store.insert_agent(
+        name="Ada Admin", email="admin@test.example", role="admin", active=True
+    )
+    return AgentContext(agent_id=agent.id, name=agent.name, role=agent.role)
+
+
+@pytest.fixture
+def agent_ctx(desk_store):
+    from src.desk.auth import AgentContext
+
+    agent, _ = desk_store.insert_agent(
+        name="Sam Agent", email="sam@test.example", role="agent", active=True
+    )
+    return AgentContext(agent_id=agent.id, name=agent.name, role=agent.role)
+
+
+@pytest.fixture
+def desk_customer(desk_store):
+    customer, _ = desk_store.insert_customer(
+        name="Alice Example", email="alice@example.com"
+    )
+    return customer
+
+
+@pytest.fixture
+def desk_service(desk_store, mock_client):
+    from src.desk.service import DeskService
+
+    return DeskService(
+        store=desk_store, llm_client=mock_client, provider="mock", model="mock-1"
+    )
+
+
+@pytest.fixture
+def desk_api(tmp_path, mock_client):
+    """Full stack on one SQLite file: inquiry service + desk service + agent ids."""
+    from fastapi.testclient import TestClient
+
+    from src.api import create_app
+    from src.desk.auth import AgentContext
+    from src.desk.service import DeskService
+    from src.desk.storage import DeskStore
+    from src.service import InquiryService
+    from src.storage import InquiryStore
+
+    db_path = tmp_path / "stack.db"
+    inquiry_store = InquiryStore(db_path)
+    inquiry_store.initialize()
+    desk_store = DeskStore(db_path)
+    desk_store.initialize()
+
+    admin, _ = desk_store.insert_agent(
+        name="Ada Admin", email="admin@test.example", role="admin", active=True
+    )
+    agent, _ = desk_store.insert_agent(
+        name="Sam Agent", email="sam@test.example", role="agent", active=True
+    )
+    inquiry_service = InquiryService(
+        llm_client=mock_client, store=inquiry_store, provider="mock", model="mock-1"
+    )
+    desk_service = DeskService(
+        store=desk_store, llm_client=mock_client, provider="mock", model="mock-1"
+    )
+    client = TestClient(
+        create_app(service=inquiry_service, desk_service=desk_service)
+    )
+    return SimpleNamespace(
+        client=client,
+        desk_store=desk_store,
+        admin=AgentContext(agent_id=admin.id, name=admin.name, role=admin.role),
+        agent=AgentContext(agent_id=agent.id, name=agent.name, role=agent.role),
+        admin_headers={"X-Agent-Id": admin.id},
+        agent_headers={"X-Agent-Id": agent.id},
+    )

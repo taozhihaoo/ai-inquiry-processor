@@ -44,6 +44,19 @@ class InvalidLLMResponseError(ValueError):
     """Raised when an LLM response does not satisfy the expected schema."""
 
 
+def validate_enum_value(value: object, vocabulary: tuple[str, ...], field_name: str) -> str:
+    """Validate one LLM-response field against a fixed vocabulary."""
+    if not isinstance(value, str):
+        raise InvalidLLMResponseError(
+            f"field '{field_name}' must be a string, got {type(value).__name__}"
+        )
+    if value not in vocabulary:
+        raise InvalidLLMResponseError(
+            f"invalid {field_name} {value!r}; expected one of {list(vocabulary)}"
+        )
+    return value
+
+
 def compute_inquiry_id(customer_name: str, message: str) -> str:
     """Stable content identity for an inquiry: SHA-256 over normalized fields.
 
@@ -85,7 +98,7 @@ class InquiryAnalysis:
     priority: str
 
     @classmethod
-    def from_dict(cls, data: object) -> "InquiryAnalysis":
+    def from_dict(cls, data: object) -> InquiryAnalysis:
         """Validate a raw LLM payload and build an analysis from it.
 
         Raises:
@@ -146,7 +159,7 @@ class InquiryResult:
         usage: TokenUsage | None = None,
         attempts: int | None = None,
         latency_ms: float | None = None,
-    ) -> "InquiryResult":
+    ) -> InquiryResult:
         return cls(
             row_number=inquiry.row_number,
             customer_name=inquiry.customer_name,
@@ -166,7 +179,7 @@ class InquiryResult:
         *,
         attempts: int | None = None,
         latency_ms: float | None = None,
-    ) -> "InquiryResult":
+    ) -> InquiryResult:
         return cls(
             row_number=inquiry.row_number,
             customer_name=inquiry.customer_name,

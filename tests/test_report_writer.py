@@ -3,14 +3,13 @@
 import csv
 import json
 
+from src.models import Inquiry, InquiryAnalysis, InquiryResult
 from src.report_writer import (
     CSV_FIELDS,
-    build_json_report,
     summarize_results,
     write_csv_report,
     write_json_report,
 )
-from src.models import Inquiry, InquiryAnalysis, InquiryResult
 
 ANALYSIS = InquiryAnalysis(summary="Cannot log in.", category="Technical Support", priority="High")
 

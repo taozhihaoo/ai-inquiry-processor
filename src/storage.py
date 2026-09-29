@@ -13,11 +13,11 @@ Design rules:
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator
 
 MEMORY_DB = ":memory:"
 
@@ -65,7 +65,49 @@ class StorageError(Exception):
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+class SQLiteConnectionManager:
+    """Owns connection handling for one SQLite database path.
+
+    File databases use one connection per operation (safe across threads);
+    ``:memory:`` databases keep a single shared connection. Foreign-key
+    enforcement is enabled on every connection, and driver errors are wrapped
+    into :class:`StorageError`.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self._path = str(db_path)
+        self._memory = self._path == MEMORY_DB
+        self._shared: sqlite3.Connection | None = None
+        if not self._memory:
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        if self._memory:
+            if self._shared is None:
+                self._shared = sqlite3.connect(MEMORY_DB, check_same_thread=False)
+                self._shared.row_factory = sqlite3.Row
+            self._shared.execute("PRAGMA foreign_keys = ON")
+            yield self._shared
+            self._shared.commit()
+            return
+        try:
+            connection = sqlite3.connect(self._path)
+        except sqlite3.Error as exc:
+            raise StorageError(f"cannot open database {self._path!r}: {exc}") from exc
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield connection
+            connection.commit()
+        except sqlite3.Error as exc:
+            connection.rollback()
+            raise StorageError(f"database operation failed: {exc}") from exc
+        finally:
+            connection.close()
 
 
 @dataclass
@@ -102,7 +144,7 @@ class InquiryRecord:
         provider: str,
         model: str | None,
         run_id: str | None = None,
-    ) -> "InquiryRecord":
+    ) -> InquiryRecord:
         now = utc_now_iso()
         return cls(
             id=id,
@@ -117,7 +159,7 @@ class InquiryRecord:
         )
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "InquiryRecord":
+    def from_row(cls, row: sqlite3.Row) -> InquiryRecord:
         return cls(**dict(row))
 
     def to_dict(self) -> dict:
@@ -147,11 +189,7 @@ class InquiryStore:
     """SQLite-backed store for inquiries and processing runs."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self._path = str(db_path)
-        self._memory = self._path == MEMORY_DB
-        self._memory_connection: sqlite3.Connection | None = None
-        if not self._memory:
-            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        self._connections = SQLiteConnectionManager(db_path)
 
     def initialize(self) -> None:
         """Create the schema if it does not exist yet (safe to call repeatedly)."""
@@ -310,27 +348,5 @@ class InquiryStore:
 
     # -- connection handling -------------------------------------------------
 
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        if self._memory:
-            if self._memory_connection is None:
-                self._memory_connection = sqlite3.connect(
-                    MEMORY_DB, check_same_thread=False
-                )
-                self._memory_connection.row_factory = sqlite3.Row
-            yield self._memory_connection
-            self._memory_connection.commit()
-            return
-        try:
-            connection = sqlite3.connect(self._path)
-        except sqlite3.Error as exc:
-            raise StorageError(f"cannot open database {self._path!r}: {exc}") from exc
-        connection.row_factory = sqlite3.Row
-        try:
-            yield connection
-            connection.commit()
-        except sqlite3.Error as exc:
-            connection.rollback()
-            raise StorageError(f"database operation failed: {exc}") from exc
-        finally:
-            connection.close()
+    def _connect(self):
+        return self._connections.connect()

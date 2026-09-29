@@ -1,6 +1,5 @@
 """Tests for the InquiryService application layer (idempotency, persistence, runs)."""
 
-import pytest
 
 from src.llm_client import AnalyzeResult, LLMRetryableError
 from src.models import Inquiry, TokenUsage, compute_inquiry_id

@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src import __version__
@@ -60,7 +60,7 @@ def write_json_document(document: dict, path: str | Path) -> Path:
 def build_json_report(results: list[InquiryResult], *, provider: str, model: str) -> dict:
     return {
         "report_metadata": {
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
             "tool": "ai-inquiry-processor",
             "tool_version": __version__,
             "provider": provider,
@@ -106,7 +106,7 @@ def build_run_report(
     failed = total - succeeded
     duplicates = sum(1 for row in rows if row.get("duplicate"))
     metadata = {
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "tool": "ai-inquiry-processor",
         "tool_version": __version__,
         "provider": provider,

@@ -9,10 +9,10 @@ import json
 import pytest
 
 from src.llm_client import (
+    SYSTEM_PROMPT,
     LLMPermanentError,
     LLMRetryableError,
     OpenAIClient,
-    SYSTEM_PROMPT,
     build_user_content,
     call_with_retries,
 )

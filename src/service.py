@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 from src.llm_client import LLMClient
 from src.models import Inquiry, TokenUsage, compute_inquiry_id
@@ -175,3 +175,8 @@ class InquiryService:
     def provider(self) -> str:
         """Configured provider name (informational, e.g. for /health)."""
         return self._provider
+
+    @property
+    def llm_client(self) -> LLMClient:
+        """The injected provider client (exposed for wiring composite apps)."""
+        return self._llm_client
