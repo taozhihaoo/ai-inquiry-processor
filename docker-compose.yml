@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Provider selection: "mock" runs fully offline (default).
+      # For real runs set LLM_PROVIDER=openai and export OPENAI_API_KEY in your shell.
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    volumes:
+      - api-data:/app/data
+      - api-output:/app/output
+    restart: unless-stopped
+
+volumes:
+  api-data:
+  api-output:

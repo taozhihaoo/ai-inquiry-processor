@@ -17,11 +17,13 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 import openai
 
-from src.models import RESPONSE_FORMAT
+from src.config import AppConfig, ConfigError
+from src.models import RESPONSE_FORMAT, TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,16 @@ Respond only with the JSON object defined by the response format."""
 
 
 class LLMClientError(Exception):
-    """Base class for LLM client failures."""
+    """Base class for LLM client failures.
+
+    ``attempts`` records how many attempts were made before the error (where
+    known) and ``retry_after`` carries a provider-requested wait in seconds.
+    """
+
+    def __init__(self, message: str, attempts: int | None = None, retry_after: float | None = None):
+        super().__init__(message)
+        self.attempts = attempts
+        self.retry_after = retry_after
 
 
 class LLMRetryableError(LLMClientError):
@@ -48,6 +59,16 @@ class LLMRetryableError(LLMClientError):
 
 class LLMPermanentError(LLMClientError):
     """Non-recoverable failure (bad credentials, malformed response, ...)."""
+
+
+@dataclass(frozen=True)
+class AnalyzeResult:
+    """Raw LLM payload plus observability metadata for persistence."""
+
+    payload: dict[str, Any]
+    attempts: int = 1
+    latency_ms: float | None = None
+    usage: TokenUsage | None = None
 
 
 class LLMClient(Protocol):
@@ -76,15 +97,75 @@ _RETRYABLE_SDK_ERRORS = (
 )
 
 
+def _extract_retry_after(exc: Exception) -> float | None:
+    """Read a numeric ``Retry-After`` header from a rate-limit response, if any."""
+    response = getattr(exc, "response", None)
+    raw = getattr(response, "headers", {}).get("retry-after") if response is not None else None
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None  # HTTP-date form is intentionally not supported
+    return max(value, 0.0)
+
+
 def _translate_exception(exc: Exception) -> LLMClientError:
     """Map SDK/network exceptions onto the retryable-vs-permanent taxonomy."""
     if isinstance(exc, LLMClientError):
         return exc
     if isinstance(exc, _RETRYABLE_SDK_ERRORS):
-        return LLMRetryableError(f"{type(exc).__name__}: {exc}")
+        return LLMRetryableError(
+            f"{type(exc).__name__}: {exc}", retry_after=_extract_retry_after(exc)
+        )
     if isinstance(exc, openai.OpenAIError):
         return LLMPermanentError(f"{type(exc).__name__}: {exc}")
     return LLMPermanentError(f"unexpected error from LLM SDK: {type(exc).__name__}: {exc}")
+
+
+@dataclass(frozen=True)
+class RetryOutcome:
+    value: Any
+    attempts: int
+
+
+def _call_with_retries_detailed(
+    func: Callable[[], Any],
+    *,
+    max_retries: int,
+    initial_delay: float,
+    max_delay: float,
+    sleep: Callable[[float], None] = time.sleep,
+) -> RetryOutcome:
+    """Call ``func`` retrying transient failures with exponential backoff.
+
+    ``max_retries`` retries are allowed after the first attempt (so
+    ``max_retries + 1`` attempts in total); permanent errors fail immediately
+    without sleeping. A provider ``Retry-After`` hint overrides the computed
+    delay for that wait.
+    """
+    delay = initial_delay
+    for attempt in range(1, max_retries + 2):
+        try:
+            return RetryOutcome(value=func(), attempts=attempt)
+        except Exception as exc:
+            translated = _translate_exception(exc)
+            translated.attempts = attempt
+            if isinstance(translated, LLMPermanentError):
+                raise translated from exc
+            if attempt > max_retries:
+                raise translated from exc
+            wait = max(delay, translated.retry_after or 0.0)
+            logger.warning(
+                "LLM call failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt,
+                max_retries + 1,
+                translated,
+                wait,
+            )
+            sleep(wait)
+            delay = min(delay * 2, max_delay)
+    raise AssertionError("unreachable: retry loop must raise or return")
 
 
 def call_with_retries(
@@ -95,36 +176,18 @@ def call_with_retries(
     max_delay: float,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Any:
-    """Call ``func`` retrying transient failures with exponential backoff.
-
-    ``max_retries`` retries are allowed after the first attempt (so
-    ``max_retries + 1`` attempts in total); permanent errors fail immediately
-    without sleeping.
-    """
-    delay = initial_delay
-    for attempt in range(1, max_retries + 2):
-        try:
-            return func()
-        except Exception as exc:
-            translated = _translate_exception(exc)
-            if isinstance(translated, LLMPermanentError):
-                raise translated from exc
-            if attempt > max_retries:
-                raise translated from exc
-            logger.warning(
-                "LLM call failed (attempt %d/%d): %s — retrying in %.1fs",
-                attempt,
-                max_retries + 1,
-                translated,
-                delay,
-            )
-            sleep(delay)
-            delay = min(delay * 2, max_delay)
-    raise AssertionError("unreachable: retry loop must raise or return")
+    """Retry helper returning only the value (see :func:`_call_with_retries_detailed`)."""
+    return _call_with_retries_detailed(
+        func,
+        max_retries=max_retries,
+        initial_delay=initial_delay,
+        max_delay=max_delay,
+        sleep=sleep,
+    ).value
 
 
-def _extract_payload(response: Any) -> dict[str, Any]:
-    """Pull the parsed JSON object out of an SDK chat-completion response."""
+def _extract_payload(response: Any) -> tuple[dict[str, Any], TokenUsage | None]:
+    """Pull the parsed JSON object (and token usage, if reported) out of an SDK response."""
     try:
         choice = response.choices[0]
         message = choice.message
@@ -148,7 +211,16 @@ def _extract_payload(response: Any) -> dict[str, Any]:
         raise LLMPermanentError(f"LLM response is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise LLMPermanentError(f"LLM response JSON must be an object, got {type(payload).__name__}")
-    return payload
+
+    raw_usage = getattr(response, "usage", None)
+    usage = None
+    if raw_usage is not None:
+        usage = TokenUsage(
+            input_tokens=getattr(raw_usage, "prompt_tokens", None),
+            output_tokens=getattr(raw_usage, "completion_tokens", None),
+            total_tokens=getattr(raw_usage, "total_tokens", None),
+        )
+    return payload, usage
 
 
 class OpenAIClient:
@@ -185,12 +257,16 @@ class OpenAIClient:
         )
 
     def analyze(self, customer_name: str, message: str) -> dict[str, Any]:
+        return self.analyze_detailed(customer_name, message).payload
+
+    def analyze_detailed(self, customer_name: str, message: str) -> AnalyzeResult:
+        """Run one inquiry and return payload + attempts/latency/usage metadata."""
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_user_content(customer_name, message)},
         ]
 
-        def _call() -> dict[str, Any]:
+        def _call() -> tuple[dict[str, Any], TokenUsage | None]:
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
@@ -198,12 +274,21 @@ class OpenAIClient:
             )
             return _extract_payload(response)
 
-        return call_with_retries(
+        started = time.perf_counter()
+        outcome = _call_with_retries_detailed(
             _call,
             max_retries=self._max_retries,
             initial_delay=self._retry_initial_delay,
             max_delay=self._retry_max_delay,
             sleep=self._sleep,
+        )
+        latency_ms = (time.perf_counter() - started) * 1000
+        payload, usage = outcome.value
+        return AnalyzeResult(
+            payload=payload,
+            attempts=outcome.attempts,
+            latency_ms=latency_ms,
+            usage=usage,
         )
 
 
@@ -237,13 +322,20 @@ class MockLLMClient:
     SUMMARY_MAX_CHARS = 140
 
     def analyze(self, customer_name: str, message: str) -> dict[str, Any]:
+        return self.analyze_detailed(customer_name, message).payload
+
+    def analyze_detailed(self, customer_name: str, message: str) -> AnalyzeResult:
+        """Deterministic offline classification; usage is ``None`` (nothing is fabricated)."""
         text = message.lower()
         category = self._categorize(text)
-        return {
+        started = time.perf_counter()
+        payload = {
             "summary": self._summarize(customer_name, message),
             "category": category,
             "priority": self._prioritize(text, category),
         }
+        latency_ms = (time.perf_counter() - started) * 1000
+        return AnalyzeResult(payload=payload, attempts=1, latency_ms=latency_ms, usage=None)
 
     def _categorize(self, text: str) -> str:
         if any(keyword in text for keyword in self.SUPPORT_KEYWORDS):
@@ -266,3 +358,23 @@ class MockLLMClient:
         if len(first_sentence) > self.SUMMARY_MAX_CHARS:
             first_sentence = first_sentence[: self.SUMMARY_MAX_CHARS - 3] + "..."
         return f"{customer_name}: {first_sentence}"
+
+
+def build_llm_client(config: AppConfig) -> LLMClient:
+    """Instantiate the configured provider client (provider selection lives here only)."""
+    if config.provider == "mock":
+        return MockLLMClient()
+    if not config.api_key:
+        raise ConfigError(
+            "OPENAI_API_KEY is not set. Export it or put it in .env (see .env.example), "
+            "or use provider 'mock' for an offline run."
+        )
+    return OpenAIClient(
+        api_key=config.api_key,
+        model=config.model,
+        base_url=config.base_url,
+        timeout_seconds=config.timeout_seconds,
+        max_retries=config.max_retries,
+        retry_initial_delay=config.retry_initial_delay,
+        retry_max_delay=config.retry_max_delay,
+    )

@@ -1,5 +1,9 @@
-# Runtime dependency: official OpenAI Python SDK
-openai>=1.40,<3
+# Runtime dependencies
+openai>=1.40,<3          # official OpenAI SDK (LLM provider)
+fastapi>=0.115           # HTTP API layer
+uvicorn>=0.30            # ASGI server
+pydantic>=2.7            # request/response validation (FastAPI dependency, pinned explicitly)
 
 # Development / testing (also available via `pip install -e .[dev]`)
 pytest>=8.0
+httpx>=0.27              # required by fastapi.testclient

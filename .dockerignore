@@ -1,0 +1,31 @@
+# Keep secrets and local artifacts out of the image
+.env
+.env.*
+!.env.example
+
+.git/
+.gitignore
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+.ruff_cache/
+
+# local data / reports are not baked into images
+data/
+output/
+*.db
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# docker files themselves (not needed inside the image)
+Dockerfile
+docker-compose.yml

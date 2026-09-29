@@ -24,8 +24,11 @@ dist/
 .coverage
 htmlcov/
 
-# --- Generated reports ---
+# --- Generated reports & local databases ---
 output/
+data/
+*.db
+*.sqlite3
 
 # --- OS / editor noise ---
 .DS_Store

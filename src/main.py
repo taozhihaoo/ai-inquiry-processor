@@ -3,6 +3,10 @@
 Works without any API key for ``--help``, ``--version`` and ``--demo`` (a
 fully offline mock provider), and reads ``OPENAI_API_KEY`` from the
 environment for real runs — never from the command line.
+
+The CLI contains no business logic: it loads the CSV, hands the inquiries to
+the shared :class:`InquiryService` (the same entry point the HTTP API uses),
+then renders reports from the persisted records.
 """
 
 from __future__ import annotations
@@ -10,14 +14,19 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from pathlib import Path
 
 from src import __version__
-from src.config import AppConfig, load_config
+from src.config import load_config
 from src.csv_loader import CSVFormatError, load_inquiries
-from src.llm_client import MockLLMClient, OpenAIClient
-from src.processor import InquiryProcessor
-from src.report_writer import summarize_results, write_csv_report, write_json_report
+from src.llm_client import build_llm_client
+from src.report_writer import (
+    RECORD_CSV_FIELDS,
+    build_run_report,
+    write_csv_rows,
+    write_json_document,
+)
+from src.service import InquiryService
+from src.storage import InquiryStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +34,6 @@ EXIT_OK = 0
 EXIT_INPUT_ERROR = 1
 EXIT_CONFIG_ERROR = 2
 
-PROVIDERS = ("openai", "mock")
 REPORT_FORMATS = ("json", "csv", "both")
 
 
@@ -34,13 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ai-inquiry-processor",
         description=(
             "Summarize, categorize and prioritize customer inquiries from a CSV "
-            "using LLM structured outputs, and emit JSON + CSV reports."
+            "using LLM structured outputs, persist results to SQLite, and emit "
+            "JSON + CSV reports."
         ),
         epilog=(
             "examples:\n"
             "  python -m src.main --demo                    # offline demo, no API key needed\n"
             "  python -m src.main -i inquiries.csv          # real run via OPENAI_API_KEY\n"
-            "  python -m src.main --format csv -o reports   # CSV report into ./reports\n"
+            "  python -m src.main --demo --db data/demo.db  # explicit SQLite location\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -53,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory for generated reports (default: %(default)s)",
     )
     parser.add_argument(
+        "--db", default=None,
+        help="SQLite database path (default: AI_INQUIRY_DB_PATH env var or data/inquiries.db)",
+    )
+    parser.add_argument(
         "--format", choices=REPORT_FORMATS, default="both",
         help="report format (default: %(default)s)",
     )
@@ -61,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="run fully offline with a deterministic mock provider (no API key needed)",
     )
     parser.add_argument(
-        "--provider", choices=PROVIDERS, default=None,
-        help="LLM provider (default: openai, or mock when --demo is given)",
+        "--provider", choices=("openai", "mock"), default=None,
+        help="LLM provider (default: LLM_PROVIDER env var, or openai; --demo forces mock)",
     )
     parser.add_argument(
         "--model", default=None,
@@ -76,18 +89,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_client(config: AppConfig) -> object:
-    """Instantiate the configured provider client (provider selection lives here only)."""
-    if config.provider == "mock":
-        return MockLLMClient()
-    return OpenAIClient(
-        api_key=config.api_key,
+def build_service(config):
+    """Wire the shared service layer: storage + provider + price configuration."""
+    store = InquiryStore(config.db_path)
+    store.initialize()
+    client = build_llm_client(config)
+    return InquiryService(
+        llm_client=client,
+        store=store,
+        provider=config.provider,
         model=config.model,
-        base_url=config.base_url,
-        timeout_seconds=config.timeout_seconds,
-        max_retries=config.max_retries,
-        retry_initial_delay=config.retry_initial_delay,
-        retry_max_delay=config.retry_max_delay,
+        price_input_per_mtok=config.price_input_per_mtok,
+        price_output_per_mtok=config.price_output_per_mtok,
     )
 
 
@@ -104,7 +117,9 @@ def main(argv: list[str] | None = None) -> int:
     provider = "mock" if args.demo else (args.provider or "openai")
     if args.demo:
         logger.info("demo mode: using the deterministic mock provider (no real API calls)")
-    config = load_config(provider=provider, model=args.model, output_dir=args.output_dir)
+    config = load_config(
+        provider=provider, model=args.model, output_dir=args.output_dir, db_path=args.db
+    )
 
     if config.provider == "openai" and not config.api_key:
         logger.error(
@@ -119,34 +134,64 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         return EXIT_INPUT_ERROR
 
-    client = build_client(config)
-    processor = InquiryProcessor(client)
+    try:
+        service = build_service(config)
+    except Exception as exc:  # provider/config wiring problems -> safe CLI error
+        logger.error("%s", exc)
+        return EXIT_CONFIG_ERROR
+
     logger.info(
-        "processing %d inquiries with provider=%s model=%s",
-        len(inquiries), config.provider, config.model,
+        "processing %d inquiries with provider=%s model=%s db=%s",
+        len(inquiries), config.provider, config.model, config.db_path,
     )
-    results = processor.process(inquiries)
+    outcome = service.process_batch(inquiries)
+    rows = _build_rows(inquiries, outcome)
 
-    output_dir = Path(config.output_dir)
-    written: list[Path] = []
+    written = []
     if args.format in ("json", "both"):
-        written.append(
-            write_json_report(
-                results, output_dir / "inquiries_report.json",
-                provider=config.provider, model=config.model,
-            )
+        report = build_run_report(
+            rows,
+            provider=config.provider,
+            model=config.model,
+            run_id=outcome.run_id,
+            database=str(config.db_path),
         )
+        written.append(write_json_document(report, config.output_dir / "inquiries_report.json"))
     if args.format in ("csv", "both"):
-        written.append(write_csv_report(results, output_dir / "inquiries_report.csv"))
+        written.append(
+            write_csv_rows(rows, RECORD_CSV_FIELDS, config.output_dir / "inquiries_report.csv")
+        )
 
-    summary = summarize_results(results)
     for path in written:
         print(f"report: {path}")
+    print(f"run: {outcome.run_id}")
     print(
-        f"processed {summary['total']} inquiries: "
-        f"{summary['succeeded']} succeeded, {summary['failed']} failed ({summary['success_rate']})"
+        f"processed {outcome.total} inquiries: "
+        f"{outcome.succeeded} succeeded, {outcome.failed} failed, "
+        f"{outcome.duplicates} duplicates"
     )
     return EXIT_OK
+
+
+def _build_rows(inquiries, outcome):
+    """Pair each input inquiry (with its CSV line number) with its stored record."""
+    rows = []
+    for inquiry, submit in zip(inquiries, outcome.outcomes):
+        record = submit.record
+        rows.append(
+            {
+                "row_number": inquiry.row_number,
+                "id": record.id,
+                "customer_name": record.customer_name,
+                "status": record.status,
+                "summary": record.summary,
+                "category": record.category,
+                "priority": record.priority,
+                "error_message": record.error_message,
+                "duplicate": submit.duplicate,
+            }
+        )
+    return rows
 
 
 if __name__ == "__main__":

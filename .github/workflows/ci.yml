@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Basic import check (no API key needed)
+        run: |
+          python -c "import src, src.config, src.models, src.llm_client, src.csv_loader, src.processor, src.report_writer, src.storage, src.service, src.main, src.api; print('all modules import cleanly')"
+
+      - name: Run tests (offline, mock provider)
+        env:
+          # ensure CI never has credentials
+          OPENAI_API_KEY: ""
+        run: pytest -v
